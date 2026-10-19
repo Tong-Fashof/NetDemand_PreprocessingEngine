@@ -1,29 +1,82 @@
-﻿using System;
+﻿using Microsoft.Data.SqlClient;
+using NetDemandPreprocessingEngine;
+using System;
 using System.Data;
-using Microsoft.Data.SqlClient;
 
 class Program
 {
+
+    // ผลลัพธ์การคำนวณ 1 แถว (1 เดือน ของ 1 สินค้า/คลัง)
+    public record DemandResult(
+        decimal AdjustedSalesQty,
+        decimal OosUpliftQty,
+        decimal NetDemandQty
+    );
+
+    // ======================================================
+    // Pure In-Memory Calculation Engine (FM-01 + FM-02)
+    // ไม่เชื่อมต่อ Database ใดๆ ทั้งสิ้น รับ input -> คืน output ตรงๆ
+    // เพื่อให้ Unit Test เรียกใช้ได้ง่าย โดยไม่ต้องมี DB จริงมารองรับ
+    // - rawSalesQty: ยอดขายดิบ (อาจเป็น null แทน NULL จาก DB, อาจติดลบได้)
+    // - oosLostQty: ยอดเสียโอกาสจากของขาด (อาจเป็น null, ปกติไม่ควรติดลบแต่ต้องป้องกันไว้)
+    // ======================================================
+    public static DemandResult Calculate(decimal? rawSalesQty, decimal? oosLostQty)
+    {
+        // ---------- FM-01: Adjusted Sales ----------
+        // ขั้นที่ 1 Null-Coalesce: NULL -> 0.0000
+        decimal cleanRawSales = rawSalesQty ?? 0.0000m;
+
+        // ขั้นที่ 2 Floor at Zero: ตัดยอดคืนสินค้าที่ทำให้ติดลบออก
+        decimal adjustedSalesQty = Math.Max(0.0000m, cleanRawSales);
+        
+
+        // ---------- FM-02: Net True Demand ----------
+        // ขั้นที่ 1 Null-Coalesce OOS: NULL -> 0.0000
+        decimal cleanOosLost = oosLostQty ?? 0.0000m;
+
+        // ขั้นที่ 2 Floor at Zero OOS: ป้องกันข้อมูล OOS ผิดปกติที่ติดลบ
+        decimal oosUpliftQty = Math.Max(0.0000m, cleanOosLost);
+
+        // ขั้นที่ 3 รวมยอดความต้องการแท้จริง
+        decimal netDemandQty = adjustedSalesQty + oosUpliftQty;
+
+        return new DemandResult(adjustedSalesQty, oosUpliftQty, netDemandQty);
+    }
+
+
     // ======================================================
     // CONFIG:
     // - targetPeriod           = null  -> ใช้ค่า default (MAX period_year_month ล่าสุดใน DRP_STG_DRP_DEMAND_24M)
     // - targetWarehouseCode    = null  -> รันทุกคลัง (Full Refresh)
     // ======================================================
+
+
     static void Main()
     {
+        // === ตั้งค่าเป็น true เพื่อรัน Unit Testing (ไม่ต่อ DB) ===
+        bool runTestsOnly = false;
+        if (runTestsOnly)
+        {
+            Tests.RunUnitTests();
+            return;
+        }
+
+
         string? targetPeriod = null;          // เช่น "202609"
         string? targetWarehouseCode = null;    // เช่น "CMPMH"
-
         try
         {
             // 1) ดึงข้อมูลดิบจาก DRP_STG_DRP_DEMAND_24M (พร้อมคำนวณ)
             DataTable data = GetRawData(targetPeriod, targetWarehouseCode);
             Console.WriteLine($"ดึงข้อมูลสำเร็จ: {data.Rows.Count} แถว");
 
-            // 2) เติมคอลัมน์ calculated_at (เวลาที่คำนวณ)
+            // 2) คำนวณ FM-01/FM-02 ด้วย DemandCalculator (ตัวเดียวกับที่ Unit Test ใช้)
+            ApplyCalculations(data);
+
+            // 3) เติมคอลัมน์ calculated_at (เวลาที่คำนวณ)
             AddCalculatedAtColumn(data);
 
-            // 3) ล้างข้อมูลเก่า + บันทึกข้อมูลใหม่ (SqlBulk)
+            // 4) ล้างข้อมูลเก่า + บันทึกข้อมูลใหม่ (SqlBulk)
             SaveToTarget(data, targetWarehouseCode);
 
             Console.WriteLine("บันทึก Snapshot สำเร็จ");
@@ -63,6 +116,7 @@ class Program
         }
     }
 
+
     // ======================================================
     // ดึงข้อมูล 24 เดือนจาก DRP_STG_DRP_DEMAND_24M
     // (FM-01=ปรับยอดขาย, FM-2.1-2.2=ปรับยอด OOS, FM-2.3=ยอดรวม(FM-01+FM-2.1-2.2), month_no)
@@ -70,47 +124,37 @@ class Program
     // ======================================================
     static DataTable GetRawData(string? targetPeriod, string? targetWarehouseCode)
     {
-        // คำสั่ง SQL หลัก:
+        // คำสั่ง SQL หลัก: ดึงข้อมูลดิบ + month_no เท่านั้น
+        // *** คำนวณ FM-01/FM-02 ผ่าน DemandCalculator
+
         // - @pTargetPeriod / @pTargetWarehouseCode คือ parameter ที่รับจาก C# (ป้องกัน SQL Injection)
         // - ถ้า @TargetPeriod ไม่ถูกส่งมา ให้ใช้ MAX(period_year_month) จาก DRP_STG_DRP_DEMAND_24M แทน (ค่า default)
         // - @StartPeriod คำนวณย้อนหลัง 23 เดือนจาก @TargetPeriod (รวมกันครบ 24 เดือน = Sliding Window)
         // - month_no ใช้ ROW_NUMBER() ไล่ 1 ถึง 24 ต่อ (warehouse_code, item_id) ตามลำดับเวลา
-
         string query = @"
-            -- รับค่า TargetPeriod: ถ้าไม่ระบุมา ใช้งวดล่าสุดที่มีใน DRP_STG_DRP_DEMAND_24M
+            -- รับค่า TargetPeriod: ถ้าไม่ระบุมา ใช้งวดล่าสุดที่มีใน Staging
             DECLARE @TargetPeriod VARCHAR(6) = @pTargetPeriod;
-            IF @TargetPeriod IS NULL SELECT @TargetPeriod = MAX(period_year_month) FROM dbo.DRP_STG_DRP_DEMAND_24M;
+            IF @TargetPeriod IS NULL
+                SELECT @TargetPeriod = MAX(period_year_month) FROM dbo.DRP_STG_DRP_DEMAND_24M;
 
             -- คำนวณ StartPeriod = TargetPeriod ย้อนหลัง 23 เดือน (รวม TargetPeriod = 24 เดือนพอดี)
-            -- หลักคิด: ย้อนหลัง N เดือน + เดือนตั้งต้นเอง = N+1 เดือน ดังนั้นย้อน 23 เดือน + ตัวเอง = 24 เดือน
-            -- ถ้า TargetPeriod = 202608 (ส.ค. 2026) -> ย้อนหลัง 23 เดือน → StartPeriod = 202409 (ก.ย. 2024)
-            DECLARE @StartPeriod VARCHAR(6) = CONVERT(VARCHAR(6), DATEADD(MONTH, -23, CONVERT(DATE, @TargetPeriod + '01', 112)), 112);
+            DECLARE @StartPeriod VARCHAR(6) =
+                CONVERT(VARCHAR(6), DATEADD(MONTH, -23, CONVERT(DATE, @TargetPeriod + '01', 112)), 112);
 
             SELECT
-                *,
+                warehouse_code,
+                item_id,
+                period_year_month,
+
                 -- ลำดับงวดสัมพัทธ์ 1 (เก่าสุด) ถึง 24 (ล่าสุด) ต่อ 1 สินค้า/คลัง
                 ROW_NUMBER() OVER (
                     PARTITION BY warehouse_code, item_id
                     ORDER BY period_year_month ASC
                 ) AS month_no,
 
-                -- raw_sales_qty: เก็บค่า Coalesce เป็น 0 เท่านั้น ไม่ Floor (ตาม Mapping Table)
-                ISNULL(raw_sales_qty, 0.0000) AS raw_sales_qty,
-
-                -- FM-01: adjusted_sales_qty = Max(0, ISNULL(raw_sales_qty, 0))
-                CASE WHEN ISNULL(raw_sales_qty, 0.0000) < 0 THEN 0.0000
-                     ELSE ISNULL(raw_sales_qty, 0.0000) END AS adjusted_sales_qty,
-
-                -- FM-02 (2.1-2.2): oos_uplift_qty = Max(0, ISNULL(oos_lost_qty, 0))
-                CASE WHEN ISNULL(oos_lost_qty, 0.0000) < 0 THEN 0.0000
-                     ELSE ISNULL(oos_lost_qty, 0.0000) END AS oos_uplift_qty,
-
-                -- FM-02 (2.3): net_demand_qty = adjusted_sales_qty + oos_uplift_qty
-                (CASE WHEN ISNULL(raw_sales_qty, 0.0000) < 0 THEN 0.0000
-                      ELSE ISNULL(raw_sales_qty, 0.0000) END)
-                +
-                (CASE WHEN ISNULL(oos_lost_qty, 0.0000) < 0 THEN 0.0000
-                      ELSE ISNULL(oos_lost_qty, 0.0000) END) AS net_demand_qty
+                -- ส่งค่าดิบตรงๆ (อาจเป็น NULL หรือติดลบ) ให้ C# เป็นคนจัดการต่อ
+                raw_sales_qty,
+                oos_lost_qty
 
             FROM dbo.DRP_STG_DRP_DEMAND_24M
             WHERE period_year_month BETWEEN @StartPeriod AND @TargetPeriod
@@ -133,6 +177,39 @@ class Program
         return table;
     }
 
+
+    // ======================================================
+    // คำนวณ FM-01 (adjusted_sales_qty) และ FM-02 (oos_uplift_qty, net_demand_qty)
+    // ด้วย DemandCalculator (Pure Function ตัวเดียวกับที่ Unit Test ใช้)
+    // แล้วเติมผลลัพธ์กลับเข้า DataTable เป็นคอลัมน์ใหม่
+    // ======================================================
+    static void ApplyCalculations(DataTable table)
+    {
+        // เพิ่มคอลัมน์ผลลัพธ์ที่ตารางปลายทางต้องการ
+        table.Columns.Add("adjusted_sales_qty", typeof(decimal));
+        table.Columns.Add("oos_uplift_qty", typeof(decimal));
+        table.Columns.Add("net_demand_qty", typeof(decimal));
+
+        foreach (DataRow row in table.Rows)
+        {
+            // อ่านค่าดิบจาก DB (รองรับกรณีเป็น DBNull)
+            decimal? rawSales = row["raw_sales_qty"] is DBNull ? null : Convert.ToDecimal(row["raw_sales_qty"]);
+            decimal? oosLost = row["oos_lost_qty"] is DBNull ? null : Convert.ToDecimal(row["oos_lost_qty"]);
+
+            // เรียก Pure Function ตัวเดียวกับที่ Tests.cs ใช้ทดสอบ
+            DemandResult result = Calculate(rawSales, oosLost);
+
+            // เติมผลลัพธ์กลับเข้าแถวเดิม
+            row["adjusted_sales_qty"] = result.AdjustedSalesQty;
+            row["oos_uplift_qty"] = result.OosUpliftQty;
+            row["net_demand_qty"] = result.NetDemandQty;
+
+            // raw_sales_qty ปลายทางต้อง Coalesce เป็น 0 (ไม่ Floor) ตาม Mapping Table
+            row["raw_sales_qty"] = rawSales ?? 0.0000m;
+        }
+    }
+
+
     // ======================================================
     // เติมคอลัมน์ calculated_at (เวลาปัจจุบัน) ==> ใช้เป็น Audit Trail ว่าแถวนี้คำนวณตอนไหน
     // ======================================================
@@ -145,6 +222,7 @@ class Program
             row["calculated_at"] = now;
         }
     }
+
 
     // ======================================================
     // บันทึกข้อมูลลงตารางปลายทาง: DRP_FCT_SKU_MONTHLY_DEMAND_PREP
