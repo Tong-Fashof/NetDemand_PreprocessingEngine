@@ -28,7 +28,7 @@ class Program
 
         // ขั้นที่ 2 Floor at Zero: ตัดยอดคืนสินค้าที่ทำให้ติดลบออก
         decimal adjustedSalesQty = Math.Max(0.0000m, cleanRawSales);
-        
+
 
         // ---------- FM-02: Net True Demand ----------
         // ขั้นที่ 1 Null-Coalesce OOS: NULL -> 0.0000
@@ -51,7 +51,7 @@ class Program
     // ======================================================
 
 
-    static void Main()
+    static void Main(string[] args)
     {
         // === ตั้งค่าเป็น true เพื่อรัน Unit Testing (ไม่ต่อ DB) ===
         bool runTestsOnly = false;
@@ -61,11 +61,37 @@ class Program
             return;
         }
 
-
-        string? targetPeriod = null;          // เช่น "202609"
+        string? targetPeriod = null;          // เช่น "202609"   
         string? targetWarehouseCode = null;    // เช่น "CMPMH"
         try
         {
+            // รับ Argument จาก Command Line (เช่น --warehouse CMPMH --period 202609)
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (args[i] == "--warehouse" && i + 1 < args.Length)
+                {
+                    targetWarehouseCode = args[++i];
+                }
+                else if (args[i] == "--period" && i + 1 < args.Length)
+                {
+                    targetPeriod = args[++i];
+
+                    // ตรวจรูปแบบ period (ต้องเป็น yyyyMM)
+                    if (targetPeriod != null && !DateTime.TryParseExact(targetPeriod + "01", "yyyyMMdd", null, System.Globalization.DateTimeStyles.None, out _))
+                    {
+                        Console.WriteLine("--period ต้องเป็นรูปแบบ yyyyMM เช่น 202609");
+                        return;
+                    }
+                }
+                else
+                {
+                    Console.WriteLine($"ไม่รู้จัก Argument: {args[i]}");
+                    Console.WriteLine($"Usage: NetDemandPreprocessingEngine.exe --warehouse CMPMH --period 202609");
+                    return;
+                }
+            }
+
+
             // 1) ดึงข้อมูลดิบจาก DRP_STG_DRP_DEMAND_24M (พร้อมคำนวณ)
             DataTable data = GetRawData(targetPeriod, targetWarehouseCode);
             Console.WriteLine($"ดึงข้อมูลสำเร็จ: {data.Rows.Count} แถว");
