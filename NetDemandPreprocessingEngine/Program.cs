@@ -53,9 +53,10 @@ class Program
 
     static void Main(string[] args)
     {
-        // === ตั้งค่าเป็น true เพื่อรัน Unit Testing (ไม่ต่อ DB) ===
-        bool runTestsOnly = false;
-        if (runTestsOnly)
+        // ======================================================
+        // ถ้า Argument --test ถูกส่งมา ให้รัน Unit Test แทนการทำงานจริง
+        // ======================================================
+        if (args.Contains("--test"))
         {
             Tests.RunUnitTests();
             return;
